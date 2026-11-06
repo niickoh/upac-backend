@@ -1,0 +1,48 @@
+# Entorno local: PostgreSQL + API. Levantar con: docker compose up --build
+# En producción la API usa la base de sphere (variables DB_* del .env) y solo se construye la imagen.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: upac
+      POSTGRES_USER: upac
+      POSTGRES_PASSWORD: upac
+      TZ: UTC
+    ports:
+      - "5433:5432"   # 5433 para no chocar con un Postgres local
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U upac -d upac"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # La base del compose manda sobre lo que diga el .env
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: upac
+      DB_USER: upac
+      DB_PASS: upac
+      DB_SSLMODE: disable
+      DB_AUTO_MIGRATE: "True"
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-True}
+      # Login del panel /admin SOLO para desarrollo local (en producción van en el .env)
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-upac2027}
+      JWT_SECRET: ${JWT_SECRET:-dev-solo-local-cambiar-en-produccion-0123456789}
+    ports:
+      - "8090:8090"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

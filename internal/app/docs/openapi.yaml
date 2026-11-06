@@ -1,0 +1,228 @@
+openapi: 3.0.3
+info:
+  title: API Inscripciones UPAC Allstars
+  version: v1
+  description: |
+    Recibe el formulario de pre-inscripción de la temporada 2027 desde el front-landing.
+    Tiene los mismos campos que el formulario de Google "Pre-Inscripciones UPAC Allstars 2027".
+
+    **Edad.** Se considera la edad cumplida al 31 de diciembre de la temporada (`TEMPORADA`).
+    `edad_temporada` y `condicion_edad` deben coincidir con `fecha_nacimiento`.
+
+    **Contacto.** Con `condicion_edad = mayor_18` son obligatorios `telefono` y `email`.
+    Con `menor_18` son obligatorios `apoderado_nombre`, `apoderado_telefono` y `apoderado_email`.
+    Los teléfonos deben ser celulares chilenos (`+56912345678`) y se guardan normalizados.
+
+    **Admin.** `POST /admin/login/` entrega un JWT; úsalo en **Authorize** para `/admin/*`.
+servers:
+  - url: /
+tags:
+  - name: inscripciones
+  - name: admin
+  - name: salud
+
+paths:
+  /health/:
+    get:
+      tags: [salud]
+      summary: Estado de la API y de la base de datos
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              example: { status: ok }
+        '503':
+          description: Base de datos no disponible
+
+  /inscripciones/:
+    post:
+      tags: [inscripciones]
+      summary: Crear una pre-inscripción (público)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PreinscripcionInput' }
+            examples:
+              menor:
+                summary: Deportista menor de edad (datos del apoderado)
+                value:
+                  nombre_completo: Martina Rojas Soto
+                  fecha_nacimiento: '2015-04-12'
+                  edad_temporada: 12
+                  experiencia: sin_experiencia
+                  ultimo_equipo: Sin equipo
+                  rol: flyer
+                  nivel_gimnasia: Nivel 1
+                  condicion_edad: menor_18
+                  apoderado_nombre: Carolina Soto Pérez
+                  apoderado_telefono: '+56912345678'
+                  apoderado_email: carolina@ejemplo.com
+              mayor:
+                summary: Deportista mayor de edad
+                value:
+                  nombre_completo: Diego Muñoz Lagos
+                  fecha_nacimiento: '2003-09-30'
+                  edad_temporada: 24
+                  experiencia: con_experiencia
+                  ultimo_equipo: Panthers Elite, 2025, nivel 4
+                  rol: base
+                  nivel_gimnasia: Nivel 3
+                  condicion_edad: mayor_18
+                  telefono: '+56987654321'
+                  email: diego@ejemplo.com
+      responses:
+        '201':
+          description: Pre-inscripción guardada
+          content:
+            application/json:
+              example: { detail: '¡Pre-inscripción recibida! Te contactaremos con todos los detalles.', id: 1 }
+        '400':
+          description: Datos inválidos (errores por campo)
+          content:
+            application/json:
+              example:
+                detail: Revisa los campos marcados.
+                errores:
+                  telefono: 'Ingresa un celular chileno válido. Ejemplo: +56912345678.'
+        '409':
+          description: El deportista ya tiene una pre-inscripción en la temporada
+        '429':
+          description: Demasiados envíos desde la misma IP (RATE_LIMIT_POR_HORA)
+
+  /admin/login/:
+    post:
+      tags: [admin]
+      summary: Login del administrador (ADMIN_USER / ADMIN_PASSWORD)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: { usuario: admin, password: upac2027 }
+      responses:
+        '200':
+          description: JWT para usar como Bearer en /admin/*
+          content:
+            application/json:
+              example: { token: eyJhbGciOi..., usuario: admin, expira: '2026-11-07T02:00:00Z' }
+        '401':
+          description: Usuario o contraseña incorrectos
+        '403':
+          description: ADMIN_PASSWORD no configurado en el servidor
+        '429':
+          description: Demasiados intentos (10 cada 15 minutos por IP)
+
+  /admin/inscripciones/:
+    get:
+      tags: [admin]
+      summary: Listar pre-inscripciones con filtros, resumen y paginación (servidor)
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: pagina, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: por_pagina, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/experiencia'
+        - $ref: '#/components/parameters/rol'
+        - $ref: '#/components/parameters/condicion_edad'
+        - $ref: '#/components/parameters/edad_min'
+        - $ref: '#/components/parameters/edad_max'
+        - $ref: '#/components/parameters/desde'
+        - $ref: '#/components/parameters/hasta'
+        - $ref: '#/components/parameters/temporada'
+      responses:
+        '200':
+          description: Una página del listado, la más reciente primero. El resumen cuenta todo lo filtrado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  temporada: { type: integer }
+                  total: { type: integer, description: Total de filas que cumplen los filtros }
+                  pagina: { type: integer, description: Página entregada (si la pedida no existe, la última) }
+                  por_pagina: { type: integer }
+                  total_paginas: { type: integer }
+                  resumen:
+                    type: object
+                    additionalProperties: { type: integer }
+                    example: { total: 12, menor_18: 9, mayor_18: 3, sin_experiencia: 7, con_experiencia: 5, base: 4, flyer: 6, ambos: 2 }
+                  resultados:
+                    type: array
+                    items: { $ref: '#/components/schemas/Preinscripcion' }
+        '400':
+          description: Filtro inválido
+        '401':
+          description: Sin sesión o sesión expirada
+
+  /admin/inscripciones/excel/:
+    get:
+      tags: [admin]
+      summary: Descargar Excel (.xlsx) con los mismos filtros del listado
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/experiencia'
+        - $ref: '#/components/parameters/rol'
+        - $ref: '#/components/parameters/condicion_edad'
+        - $ref: '#/components/parameters/edad_min'
+        - $ref: '#/components/parameters/edad_max'
+        - $ref: '#/components/parameters/desde'
+        - $ref: '#/components/parameters/hasta'
+        - $ref: '#/components/parameters/temporada'
+      responses:
+        '200':
+          description: Archivo preinscripciones-<temporada>-<fecha>.xlsx
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: { type: string, format: binary }
+        '401':
+          description: Sin sesión o sesión expirada
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    q: { in: query, name: q, schema: { type: string }, description: 'Busca en nombres, correos, teléfonos y último equipo' }
+    experiencia: { in: query, name: experiencia, schema: { type: string, enum: [sin_experiencia, con_experiencia] } }
+    rol: { in: query, name: rol, schema: { type: string, enum: [base, flyer, ambos] } }
+    condicion_edad: { in: query, name: condicion_edad, schema: { type: string, enum: [menor_18, mayor_18] } }
+    edad_min: { in: query, name: edad_min, schema: { type: integer, minimum: 1, maximum: 100 } }
+    edad_max: { in: query, name: edad_max, schema: { type: integer, minimum: 1, maximum: 100 } }
+    desde: { in: query, name: desde, schema: { type: string, format: date }, description: Fecha de inscripción desde (hora de Chile) }
+    hasta: { in: query, name: hasta, schema: { type: string, format: date }, description: Fecha de inscripción hasta, inclusive }
+    temporada: { in: query, name: temporada, schema: { type: integer, example: 2027 } }
+  schemas:
+    PreinscripcionInput:
+      type: object
+      required: [nombre_completo, fecha_nacimiento, edad_temporada, experiencia, ultimo_equipo, rol, nivel_gimnasia, condicion_edad]
+      properties:
+        nombre_completo: { type: string, maxLength: 150, description: Nombres y Apellidos }
+        fecha_nacimiento: { type: string, format: date, description: Fecha de Nacimiento (AAAA-MM-DD) }
+        edad_temporada: { type: integer, minimum: 1, maximum: 100, description: Edad cumplida al 31 de diciembre de la temporada }
+        experiencia: { type: string, enum: [sin_experiencia, con_experiencia], description: Experiencia en Cheerleading }
+        ultimo_equipo: { type: string, maxLength: 200, description: 'Último equipo: nombre, año de participación y nivel' }
+        rol: { type: string, enum: [base, flyer, ambos], description: Rol o Posición }
+        nivel_gimnasia: { type: string, maxLength: 100, description: Nivel de Gimnasia Logrado }
+        condicion_edad: { type: string, enum: [menor_18, mayor_18], description: Condición de edad al 31 de diciembre }
+        telefono: { type: string, example: '+56912345678', description: Solo mayor_18 }
+        email: { type: string, format: email, description: Solo mayor_18 }
+        apoderado_nombre: { type: string, maxLength: 150, description: Solo menor_18 }
+        apoderado_telefono: { type: string, example: '+56912345678', description: Solo menor_18 }
+        apoderado_email: { type: string, format: email, description: Solo menor_18 }
+    Preinscripcion:
+      allOf:
+        - $ref: '#/components/schemas/PreinscripcionInput'
+        - type: object
+          properties:
+            id: { type: integer }
+            temporada: { type: integer }
+            experiencia_label: { type: string, example: Sin experiencia previa }
+            rol_label: { type: string, example: Flyer }
+            condicion_edad_label: { type: string, example: Menor de 18 años }
+            estado: { type: string, example: pendiente }
+            created_at: { type: string, format: date-time }
