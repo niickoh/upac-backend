@@ -274,47 +274,19 @@ func (a *App) crearPreinscripcion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var in preinscripcionInput
-	body := http.MaxBytesReader(w, r.Body, 64<<10)
-	dec := json.NewDecoder(body)
-	if err := dec.Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, detail("El cuerpo de la petición debe ser un JSON válido."))
+	in, ok := decodeInput(w, r)
+	if !ok {
 		return
 	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		writeJSON(w, http.StatusBadRequest, detail("El cuerpo de la petición debe ser un único objeto JSON."))
+	p, ok := validarRequest(w, in, a.cfg.Temporada)
+	if !ok {
 		return
-	}
-
-	hoy := time.Now().In(chileTZ())
-	hoyFecha := time.Date(hoy.Year(), hoy.Month(), hoy.Day(), 0, 0, 0, 0, time.UTC)
-	p, errs := validar(in, a.cfg.Temporada, hoyFecha)
-	if len(errs) > 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"detail":  "Revisa los campos marcados.",
-			"errores": errs,
-		})
-		return
-	}
-
-	emailContacto := p.Email
-	if emailContacto == nil {
-		emailContacto = p.ApoderadoEmail
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	var dup duplicado
-	err := pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
-		// Serializa los envíos de la temporada para que dos iguales no pasen a la vez
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('inscripciones_preinscripcion'), $1)`, p.Temporada); err != nil {
-			return err
-		}
-		var err error
-		if dup, err = buscarDuplicado(ctx, tx, p, *emailContacto); err != nil || dup != sinDuplicado {
-			return err
-		}
+	dup, err := a.guardarSinDuplicados(ctx, p, 0, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			INSERT INTO inscripciones_preinscripcion (
 				temporada, nombre_completo, fecha_nacimiento, edad_temporada,
@@ -327,14 +299,8 @@ func (a *App) crearPreinscripcion(w http.ResponseWriter, r *http.Request) {
 			p.Telefono, p.Email, p.ApoderadoNombre, p.ApoderadoTelefono, p.ApoderadoEmail,
 		).Scan(&p.ID, &p.Estado, &p.CreatedAt)
 	})
-	if dup == sinDuplicado && isUniqueViolation(err) {
-		dup = duplicadoGenerico
-	}
 	if dup != sinDuplicado {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"detail":  mensajeDuplicado(dup, p.NombreCompleto, p.Temporada),
-			"errores": camposDuplicado(dup),
-		})
+		writeDuplicado(w, dup, p)
 		return
 	}
 	if err != nil {
@@ -360,10 +326,72 @@ const (
 	duplicadoGenerico // lo rechazó un índice único de la base
 )
 
+// decodeInput lee el JSON del formulario (un único objeto, máx. 64 KB).
+func decodeInput(w http.ResponseWriter, r *http.Request) (preinscripcionInput, bool) {
+	var in preinscripcionInput
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err := dec.Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, detail("El cuerpo de la petición debe ser un JSON válido."))
+		return in, false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, detail("El cuerpo de la petición debe ser un único objeto JSON."))
+		return in, false
+	}
+	return in, true
+}
+
+// validarRequest valida contra "hoy" en Chile y responde 400 con los errores por campo.
+func validarRequest(w http.ResponseWriter, in preinscripcionInput, temporada int) (preinscripcion, bool) {
+	hoy := time.Now().In(chileTZ())
+	hoyFecha := time.Date(hoy.Year(), hoy.Month(), hoy.Day(), 0, 0, 0, 0, time.UTC)
+	p, errs := validar(in, temporada, hoyFecha)
+	if len(errs) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"detail":  "Revisa los campos marcados.",
+			"errores": errs,
+		})
+		return p, false
+	}
+	return p, true
+}
+
+// guardarSinDuplicados ejecuta write en una transacción solo si p no duplica a otra
+// pre-inscripción (excluyendo excluirID, para las ediciones). Los envíos de una
+// misma temporada se serializan para que dos iguales no pasen a la vez.
+func (a *App) guardarSinDuplicados(ctx context.Context, p preinscripcion, excluirID int64, write func(pgx.Tx) error) (duplicado, error) {
+	emailContacto := p.Email
+	if emailContacto == nil {
+		emailContacto = p.ApoderadoEmail
+	}
+	dup := sinDuplicado
+	err := pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('inscripciones_preinscripcion'), $1)`, p.Temporada); err != nil {
+			return err
+		}
+		var err error
+		if dup, err = buscarDuplicado(ctx, tx, p, *emailContacto, excluirID); err != nil || dup != sinDuplicado {
+			return err
+		}
+		return write(tx)
+	})
+	if dup == sinDuplicado && isUniqueViolation(err) {
+		dup = duplicadoGenerico
+	}
+	return dup, err
+}
+
+func writeDuplicado(w http.ResponseWriter, dup duplicado, p preinscripcion) {
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"detail":  mensajeDuplicado(dup, p.NombreCompleto, p.Temporada),
+		"errores": camposDuplicado(dup),
+	})
+}
+
 // buscarDuplicado revisa, en la misma temporada y con el mismo primer nombre,
-// si ya hay una pre-inscripción con el mismo email de contacto o la misma
+// si ya hay otra pre-inscripción con el mismo email de contacto o la misma
 // fecha de nacimiento. Usa las mismas expresiones que los índices de la migración 002.
-func buscarDuplicado(ctx context.Context, tx pgx.Tx, p preinscripcion, emailContacto string) (duplicado, error) {
+func buscarDuplicado(ctx context.Context, tx pgx.Tx, p preinscripcion, emailContacto string, excluirID int64) (duplicado, error) {
 	var porEmail, porFecha bool
 	err := tx.QueryRow(ctx, fmt.Sprintf(`
 		SELECT
@@ -371,10 +399,11 @@ func buscarDuplicado(ctx context.Context, tx pgx.Tx, p preinscripcion, emailCont
 			coalesce(bool_or(fecha_nacimiento = $4::date), false)
 		FROM inscripciones_preinscripcion
 		WHERE temporada = $1
+		  AND id <> $5
 		  AND %s = %s
 		  AND (lower(coalesce(email, apoderado_email)) = lower($3::text) OR fecha_nacimiento = $4::date)`,
 		fmt.Sprintf(primerNombreSQL, "nombre_completo"), fmt.Sprintf(primerNombreSQL, "$2::text")),
-		p.Temporada, p.NombreCompleto, emailContacto, p.FechaNacimiento,
+		p.Temporada, p.NombreCompleto, emailContacto, p.FechaNacimiento, excluirID,
 	).Scan(&porEmail, &porFecha)
 	switch {
 	case err != nil:

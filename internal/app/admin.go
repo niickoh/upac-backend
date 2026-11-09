@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -310,6 +312,104 @@ func (a *App) adminExcel(w http.ResponseWriter, r *http.Request) {
 	if err := xlsx.Write(w); err != nil {
 		log.Printf("error enviando el Excel: %v", err)
 	}
+}
+
+// pathID lee {id} de la ruta; responde 404 si no es un número válido.
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		writeJSON(w, http.StatusNotFound, detail("Pre-inscripción no encontrada."))
+		return 0, false
+	}
+	return id, true
+}
+
+// adminActualizar: PUT /admin/inscripciones/{id}/ con el mismo JSON y las mismas
+// reglas que el formulario público (incluido el control de duplicados).
+func (a *App) adminActualizar(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	in, ok := decodeInput(w, r)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	// Se valida con la temporada del registro, no con la configurada
+	var temporada int16
+	err := a.db.QueryRow(ctx, `SELECT temporada FROM inscripciones_preinscripcion WHERE id = $1`, id).Scan(&temporada)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, detail("La pre-inscripción ya no existe."))
+		return
+	}
+	if err != nil {
+		log.Printf("no se pudo leer la pre-inscripción %d: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, detail("Error interno del servidor."))
+		return
+	}
+
+	p, ok := validarRequest(w, in, int(temporada))
+	if !ok {
+		return
+	}
+	p.ID = id
+
+	dup, err := a.guardarSinDuplicados(ctx, p, id, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			UPDATE inscripciones_preinscripcion SET
+				nombre_completo = $2, fecha_nacimiento = $3, edad_temporada = $4,
+				experiencia = $5, ultimo_equipo = $6, rol = $7, nivel_gimnasia = $8, condicion_edad = $9,
+				telefono = $10, email = $11, apoderado_nombre = $12, apoderado_telefono = $13, apoderado_email = $14
+			WHERE id = $1
+			RETURNING estado, created_at`,
+			id, p.NombreCompleto, p.FechaNacimiento, p.EdadTemporada,
+			p.Experiencia, p.UltimoEquipo, p.Rol, p.NivelGimnasia, p.CondicionEdad,
+			p.Telefono, p.Email, p.ApoderadoNombre, p.ApoderadoTelefono, p.ApoderadoEmail,
+		).Scan(&p.Estado, &p.CreatedAt)
+	})
+	switch {
+	case dup != sinDuplicado:
+		writeDuplicado(w, dup, p)
+	case errors.Is(err, pgx.ErrNoRows):
+		writeJSON(w, http.StatusNotFound, detail("La pre-inscripción ya no existe."))
+	case err != nil:
+		log.Printf("no se pudo actualizar la pre-inscripción %d: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, detail("No se pudieron guardar los cambios."))
+	default:
+		log.Printf("admin: pre-inscripción %d actualizada", id)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"detail":   "Cambios guardados.",
+			"inscrito": p,
+		})
+	}
+}
+
+// adminEliminar: DELETE /admin/inscripciones/{id}/ (borrado definitivo).
+func (a *App) adminEliminar(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	var nombre string
+	err := a.db.QueryRow(ctx, `DELETE FROM inscripciones_preinscripcion WHERE id = $1 RETURNING nombre_completo`, id).Scan(&nombre)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, detail("La pre-inscripción ya no existe."))
+		return
+	}
+	if err != nil {
+		log.Printf("no se pudo eliminar la pre-inscripción %d: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, detail("No se pudo eliminar la pre-inscripción."))
+		return
+	}
+	log.Printf("admin: pre-inscripción %d eliminada (%s)", id, nombre)
+	writeJSON(w, http.StatusOK, detail(fmt.Sprintf("Se eliminó la pre-inscripción de %s.", nombre)))
 }
 
 // ---------- Excel ----------

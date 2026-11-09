@@ -181,6 +181,53 @@ paths:
         '401':
           description: Sin sesión o sesión expirada
 
+  /admin/inscripciones/{id}/:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, minimum: 1 }
+    put:
+      tags: [admin]
+      summary: Editar una pre-inscripción (mismas reglas y control de duplicados que el formulario)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PreinscripcionInput' }
+      responses:
+        '200':
+          description: Cambios guardados
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: { type: string }
+                  inscrito: { $ref: '#/components/schemas/Preinscripcion' }
+        '400':
+          description: Campos inválidos (detalle por campo en `errores`)
+        '401':
+          description: Sin sesión o sesión expirada
+        '404':
+          description: La pre-inscripción no existe
+        '409':
+          description: Quedaría duplicada con otra pre-inscripción de la temporada
+    delete:
+      tags: [admin]
+      summary: Eliminar definitivamente una pre-inscripción
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Eliminada
+        '401':
+          description: Sin sesión o sesión expirada
+        '404':
+          description: La pre-inscripción no existe
+
 components:
   securitySchemes:
     bearerAuth:

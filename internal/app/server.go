@@ -58,6 +58,8 @@ func (a *App) registerRoutes() {
 	a.mux.HandleFunc("POST /admin/login/{$}", a.adminLogin)
 	a.mux.HandleFunc("GET /admin/inscripciones/{$}", a.requireAdmin(a.adminListar))
 	a.mux.HandleFunc("GET /admin/inscripciones/excel/{$}", a.requireAdmin(a.adminExcel))
+	a.mux.HandleFunc("PUT /admin/inscripciones/{id}/{$}", a.requireAdmin(a.adminActualizar))
+	a.mux.HandleFunc("DELETE /admin/inscripciones/{id}/{$}", a.requireAdmin(a.adminEliminar))
 
 	if a.cfg.SwaggerEnabled {
 		a.registerDocs()
@@ -89,7 +91,7 @@ func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 		h.Set("Access-Control-Expose-Headers", "Content-Disposition")
 		if r.Method == http.MethodOptions {
 			h.Set("Access-Control-Allow-Headers", "accept, authorization, content-type")
-			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			h.Set("Access-Control-Max-Age", "86400")
 		}
 	}
@@ -119,7 +121,7 @@ func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 
 // allowsOtherMethod indica si la ruta existe con otro método (para responder 405 en vez de 404).
 func allowsOtherMethod(mux *http.ServeMux, r *http.Request) bool {
-	for _, m := range []string{http.MethodGet, http.MethodPost} {
+	for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
 		if m == r.Method {
 			continue
 		}
