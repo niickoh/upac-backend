@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Valores permitidos de cada pregunta de opción del formulario de Google.
@@ -35,6 +37,13 @@ var (
 
 // Mismo patrón que valida el formulario de Google: celular chileno, p. ej. +56912345678.
 var celularChileno = regexp.MustCompile(`^(\+?56)?\s?9\s?\d{4}\s?\d{4}$`)
+
+// Al menos dos palabras (primer nombre y apellido paterno), solo letras, apóstrofo o guion.
+var nombreValido = regexp.MustCompile(`^\p{L}[\p{L}'’-]* \p{L}[\p{L}'’-]*( \p{L}[\p{L}'’-]*)*$`)
+
+// primerNombreSQL normaliza la primera palabra del nombre igual que los índices de
+// la migración 002 (minúsculas y sin tildes). %s es la columna o el parámetro.
+const primerNombreSQL = `translate(lower(split_part(%s, ' ', 1)), 'áéíóúüñ', 'aeiouun')`
 
 // preinscripcionInput es el JSON que envía el front (todas las claves en snake_case).
 type preinscripcionInput struct {
@@ -168,8 +177,8 @@ func validar(in preinscripcionInput, temporada int, hoy time.Time) (preinscripci
 
 	// 1. Datos del deportista
 	p.NombreCompleto = requiredText(errs, "nombre_completo", in.NombreCompleto, "Ingresa tu nombre completo.", 150)
-	if _, bad := errs["nombre_completo"]; !bad && utf8.RuneCountInString(p.NombreCompleto) < 3 {
-		errs["nombre_completo"] = "Ingresa tu nombre completo."
+	if _, bad := errs["nombre_completo"]; !bad && !nombreValido.MatchString(p.NombreCompleto) {
+		errs["nombre_completo"] = "Ingresa al menos tu primer nombre y apellido paterno, solo con letras."
 	}
 
 	edadCalculada := 0
@@ -288,22 +297,44 @@ func (a *App) crearPreinscripcion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	emailContacto := p.Email
+	if emailContacto == nil {
+		emailContacto = p.ApoderadoEmail
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	err := a.db.QueryRow(ctx, `
-		INSERT INTO inscripciones_preinscripcion (
-			temporada, nombre_completo, fecha_nacimiento, edad_temporada,
-			experiencia, ultimo_equipo, rol, nivel_gimnasia, condicion_edad,
-			telefono, email, apoderado_nombre, apoderado_telefono, apoderado_email
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		RETURNING id, estado, created_at`,
-		p.Temporada, p.NombreCompleto, p.FechaNacimiento, p.EdadTemporada,
-		p.Experiencia, p.UltimoEquipo, p.Rol, p.NivelGimnasia, p.CondicionEdad,
-		p.Telefono, p.Email, p.ApoderadoNombre, p.ApoderadoTelefono, p.ApoderadoEmail,
-	).Scan(&p.ID, &p.Estado, &p.CreatedAt)
-	if isUniqueViolation(err) {
-		writeJSON(w, http.StatusConflict, detail(fmt.Sprintf(
-			"Ya existe una pre-inscripción de %s para la temporada %d.", p.NombreCompleto, p.Temporada)))
+
+	var dup duplicado
+	err := pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
+		// Serializa los envíos de la temporada para que dos iguales no pasen a la vez
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('inscripciones_preinscripcion'), $1)`, p.Temporada); err != nil {
+			return err
+		}
+		var err error
+		if dup, err = buscarDuplicado(ctx, tx, p, *emailContacto); err != nil || dup != sinDuplicado {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			INSERT INTO inscripciones_preinscripcion (
+				temporada, nombre_completo, fecha_nacimiento, edad_temporada,
+				experiencia, ultimo_equipo, rol, nivel_gimnasia, condicion_edad,
+				telefono, email, apoderado_nombre, apoderado_telefono, apoderado_email
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			RETURNING id, estado, created_at`,
+			p.Temporada, p.NombreCompleto, p.FechaNacimiento, p.EdadTemporada,
+			p.Experiencia, p.UltimoEquipo, p.Rol, p.NivelGimnasia, p.CondicionEdad,
+			p.Telefono, p.Email, p.ApoderadoNombre, p.ApoderadoTelefono, p.ApoderadoEmail,
+		).Scan(&p.ID, &p.Estado, &p.CreatedAt)
+	})
+	if dup == sinDuplicado && isUniqueViolation(err) {
+		dup = duplicadoGenerico
+	}
+	if dup != sinDuplicado {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"detail":  mensajeDuplicado(dup, p.NombreCompleto, p.Temporada),
+			"errores": camposDuplicado(dup),
+		})
 		return
 	}
 	if err != nil {
@@ -316,6 +347,65 @@ func (a *App) crearPreinscripcion(w http.ResponseWriter, r *http.Request) {
 		"detail": "¡Pre-inscripción recibida! Te contactaremos con todos los detalles.",
 		"id":     p.ID,
 	})
+}
+
+// ---------- Duplicados ----------
+
+type duplicado int
+
+const (
+	sinDuplicado duplicado = iota
+	duplicadoEmail
+	duplicadoFecha
+	duplicadoGenerico // lo rechazó un índice único de la base
+)
+
+// buscarDuplicado revisa, en la misma temporada y con el mismo primer nombre,
+// si ya hay una pre-inscripción con el mismo email de contacto o la misma
+// fecha de nacimiento. Usa las mismas expresiones que los índices de la migración 002.
+func buscarDuplicado(ctx context.Context, tx pgx.Tx, p preinscripcion, emailContacto string) (duplicado, error) {
+	var porEmail, porFecha bool
+	err := tx.QueryRow(ctx, fmt.Sprintf(`
+		SELECT
+			coalesce(bool_or(lower(coalesce(email, apoderado_email)) = lower($3::text)), false),
+			coalesce(bool_or(fecha_nacimiento = $4::date), false)
+		FROM inscripciones_preinscripcion
+		WHERE temporada = $1
+		  AND %s = %s
+		  AND (lower(coalesce(email, apoderado_email)) = lower($3::text) OR fecha_nacimiento = $4::date)`,
+		fmt.Sprintf(primerNombreSQL, "nombre_completo"), fmt.Sprintf(primerNombreSQL, "$2::text")),
+		p.Temporada, p.NombreCompleto, emailContacto, p.FechaNacimiento,
+	).Scan(&porEmail, &porFecha)
+	switch {
+	case err != nil:
+		return sinDuplicado, err
+	case porEmail:
+		return duplicadoEmail, nil
+	case porFecha:
+		return duplicadoFecha, nil
+	}
+	return sinDuplicado, nil
+}
+
+func mensajeDuplicado(d duplicado, nombre string, temporada int) string {
+	switch d {
+	case duplicadoEmail:
+		return fmt.Sprintf("Ya existe una pre-inscripción de %s con este correo para la temporada %d.", nombre, temporada)
+	case duplicadoFecha:
+		return fmt.Sprintf("Ya existe una pre-inscripción de %s con esta fecha de nacimiento para la temporada %d.", nombre, temporada)
+	}
+	return fmt.Sprintf("Ya existe una pre-inscripción de %s para la temporada %d.", nombre, temporada)
+}
+
+func camposDuplicado(d duplicado) map[string]string {
+	msg := "Ya existe una pre-inscripción con estos datos."
+	switch d {
+	case duplicadoEmail:
+		return map[string]string{"nombre_completo": msg, "email": msg, "apoderado_email": msg}
+	case duplicadoFecha:
+		return map[string]string{"nombre_completo": msg, "fecha_nacimiento": msg}
+	}
+	return map[string]string{"nombre_completo": msg}
 }
 
 // chileTZ se usa para decidir qué día es "hoy" al validar la fecha de nacimiento.
